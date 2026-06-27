@@ -13,6 +13,7 @@
 """
 
 import cv2, mediapipe as mp, numpy as np, time, sys, json
+import os, threading, tempfile, ctypes
 from collections import deque
 
 CAM_INDEX   = 1
@@ -33,15 +34,79 @@ CONF_THRESHOLD  = 0.55
 PREDICT_EVERY   = 2     # predict ทุก N frames เพื่อเพิ่ม FPS
 MODEL_PATH      = "model/lstm_model.h5"
 
+LABEL_MAP_PATH  = "model/label_map.json"
+
 try:
     import tensorflow as tf
     lstm_model = tf.keras.models.load_model(MODEL_PATH)
     print(f"  [LSTM] Model loaded: {MODEL_PATH}")
     USE_LSTM = True
+    # โหลด label map (idx -> gesture name) ถ้ามี
+    try:
+        with open(LABEL_MAP_PATH, encoding="utf-8") as f:
+            _lm = json.load(f)
+        GESTURES = [_lm[str(i)] for i in range(len(_lm))]
+        print(f"  [LSTM] Label map: {GESTURES}")
+    except Exception as e:
+        print(f"  [LSTM] ใช้ GESTURES default ({e})")
 except Exception as e:
     print(f"  [FALLBACK] Rule-based mode ({e})")
     lstm_model = None
     USE_LSTM   = False
+
+# ===================== Text-to-Speech =====================
+# gTTS (ออนไลน์ เสียงไทยธรรมชาติ) → fallback pyttsx3 (ออฟไลน์ SAPI5)
+TTS_LANG = "th"
+_tts_lock = threading.Lock()
+
+try:
+    from gtts import gTTS
+    GTTS_OK = True
+except Exception:
+    GTTS_OK = False
+try:
+    import pyttsx3
+    PYTTSX3_OK = True
+except Exception:
+    PYTTSX3_OK = False
+
+def _play_mp3(path):
+    """เล่น mp3 ผ่าน Windows MCI (winmm.dll) — ไม่ต้องลง dependency เพิ่ม"""
+    alias = f"ttsclip{int(time.time()*1000)}"
+    mci = ctypes.windll.winmm.mciSendStringW
+    mci(f'open "{path}" type mpegvideo alias {alias}', None, 0, None)
+    buf = ctypes.create_unicode_buffer(64)
+    mci(f'status {alias} length', buf, 64, None)
+    try:    length = int(buf.value)
+    except (ValueError, TypeError): length = 2500
+    mci(f'play {alias}', None, 0, None)
+    time.sleep(length/1000.0 + 0.2)
+    mci(f'close {alias}', None, 0, None)
+
+def _speak_worker(text):
+    with _tts_lock:
+        if GTTS_OK:
+            try:
+                tmp = os.path.join(tempfile.gettempdir(), f"sign_tts_{int(time.time()*1000)}.mp3")
+                gTTS(text=text, lang=TTS_LANG).save(tmp)
+                _play_mp3(tmp)
+                try: os.remove(tmp)
+                except OSError: pass
+                return
+            except Exception as e:
+                print(f"  [TTS] gTTS ใช้ไม่ได้ → fallback pyttsx3 ({e})")
+        if PYTTSX3_OK:
+            try:
+                eng = pyttsx3.init()
+                eng.say(text); eng.runAndWait(); eng.stop()
+            except Exception as e:
+                print(f"  [TTS] pyttsx3 ใช้ไม่ได้ ({e})")
+
+def speak(text):
+    """พูดข้อความใน background thread (ไม่บล็อก camera loop)"""
+    if not text: return
+    threading.Thread(target=_speak_worker, args=(text,), daemon=True).start()
+# ==========================================================
 
 mp_hands = mp.solutions.hands
 mp_draw  = mp.solutions.drawing_utils
@@ -189,6 +254,7 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,1280); cap.set(cv2.CAP_PROP_FRAME_HEIGHT,720); cap.set(cv2.CAP_PROP_FPS,30)
     smoother=Smoother(); prev_t=time.time(); shot_n=0
     lstm_buf=deque(maxlen=SEQUENCE_LENGTH); frame_count=0
+    last_spoken=None
     print("="*56)
     print("  Smart Thai Sign Language  —  3 Basic Words")
     print("="*56)
@@ -237,6 +303,11 @@ def main():
                     side=hinfo.classification[0].label; lm=lm_np(hlm)
                     rg,rc,rh=classify(lm,side); break
         gesture,conf,hint=smoother.push(rg,rc,rh)
+        # TTS: พูดเฉพาะตอน gesture เปลี่ยนเป็นท่าใหม่ (ไม่พูดทุกเฟรม)
+        if gesture and gesture!=last_spoken:
+            speak(INFO[gesture]["th"]); last_spoken=gesture
+        elif gesture is None:
+            last_spoken=None
         draw_result(frame,gesture,conf,hint)
         draw_guide(frame,gesture)
         mode_text = f"LSTM  FPS {fps:.0f}" if USE_LSTM else f"RULE  FPS {fps:.0f}"
